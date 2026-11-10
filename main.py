@@ -151,7 +151,7 @@ async def generate_voice_assistant_response(payload: VoiceRequest, authorization
     }
     body = {
         "text": ai_response_text,
-        "model_id": "eleven_multilingual_v2",
+        "model_id": "eleven_v4_turbo",
         "voice_settings": {
             "stability": 0.35,
             "similarity_boost": 0.85
