@@ -40,6 +40,10 @@ class ChatRequest(BaseModel):
     all_traffic: list
     communicated: list
 
+class TopupRequest(BaseModel):
+    email: str
+    credits_to_add: int
+
 @app.post("/transcribe-audio")
 async def transcribe_audio_from_client(file: UploadFile = File(...)):
     """Non-blocking audio transcription using Gemini STT"""
@@ -174,6 +178,19 @@ async def generate_voice_assistant_response(payload: VoiceRequest, authorization
 
     from fastapi.responses import Response
     return Response(content=tts_responses.content, media_type="audio/mpeg")
+
+@app.post("/add-credits")
+async def add_user_credits_api(payload: TopupRequest):
+    """Secure endpoint to add credits upon successful Cashfree payment using Supabase RPC upsert safety"""
+    try:
+        res = supabase.rpc("add_user_credits_secure", {
+            "p_email": payload.email,
+            "p_amount": payload.credits_to_add
+        }).execute()
+        
+        return {"status": "success", "message": f"Successfully added {payload.credits_to_add} credits for {payload.email}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to add credits: {str(e)}")
 
 @app.get("/")
 def home():
