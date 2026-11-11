@@ -4,6 +4,7 @@ requests
 pydantic
 python-dotenv
 supabase
+google-genai
 google-generativeai
 python-multipart
 httpx
