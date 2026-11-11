@@ -38,6 +38,7 @@ class ChatRequest(BaseModel):
     selected_language: str
     timetable: list
     all_traffic: list
+    station_instructions: dict = {}  # Dynamic instructions mapping for any scenario
     communicated: list
 
 class TopupRequest(BaseModel):
@@ -76,11 +77,19 @@ async def transcribe_audio_from_client(file: UploadFile = File(...)):
 
 @app.post("/generate-chat")
 async def generate_role_chat_response(payload: ChatRequest):
-    """Asynchronous role chat generation"""
+    """Asynchronous role chat generation with dynamic scenario instructions injection"""
     try:
         player_timetable_json = str(payload.timetable)
         all_traffic_json = str(payload.all_traffic)
         
+        # Format dynamic station instructions cleanly so LLM can read rules for ANY scenario loaded
+        instructions_formatted = ""
+        if payload.station_instructions:
+            for k, v in payload.station_instructions.items():
+                instructions_formatted += f"- {k.replace('_', ' ').upper()}: {v}\n"
+        else:
+            instructions_formatted = "No special station instructions for this scenario. Operate as per standard timetable and signal aspects."
+
         final_dest = "destination"
         if payload.timetable:
             final_dest = str(payload.timetable[-1].get("station", "destination")).lower()
@@ -90,6 +99,9 @@ async def generate_role_chat_response(payload: ChatRequest):
         Player Train: {payload.train_name}.
         Final Destination Station: {final_dest}.
         User Preferred Communication Language Option: {payload.selected_language}.
+        
+        CRITICAL ACTIVE SCENARIO RULES & STATION INSTRUCTIONS (APPLY THESE DYNAMICALLY):
+        {instructions_formatted}
         
         CRITICAL GROUNDING DATABASE (DO NOT DEVIATE):
         {player_timetable_json}
