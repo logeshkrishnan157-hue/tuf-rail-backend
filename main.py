@@ -2,11 +2,14 @@ import os
 import shutil
 import asyncio
 import httpx
-from fastapi import FastAPI, HTTPException, Header, UploadFile, File
+import hashlib
+import json
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client, Client
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 load_dotenv() # Loads keys from .env file
 
@@ -18,10 +21,12 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-# Initialize Supabase & Gemini
+# Initialize Supabase & GenAI Client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-3.8-flash')
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Dictionary to manage active server-side caches per scenario session
+active_scenario_caches = {}
 
 # 🔒 SEMAPHORE GUARD: Restricts max concurrent calls to ElevenLabs matching your Creator Plan (5)
 ELEVENLABS_SEMAPHORE = asyncio.Semaphore(5)
@@ -38,7 +43,7 @@ class ChatRequest(BaseModel):
     selected_language: str
     timetable: list
     all_traffic: list
-    station_instructions: dict = {}  # Dynamic instructions mapping for any scenario
+    station_instructions: dict = {}
     communicated: list
 
 class TopupRequest(BaseModel):
@@ -56,13 +61,16 @@ async def transcribe_audio_from_client(file: UploadFile = File(...)):
         with open(temp_audio_path, "rb") as af:
             audio_bytes = af.read()
 
-        stt_response = model.generate_content([
-            {
-                "mime_type": "audio/wav",
-                "data": audio_bytes
-            },
-            "Listen to this walkie-talkie transmission from a Loco Pilot. It can be in English, Tamil, Hindi, Telugu, Malayalam, Kannada, or mixed code-switching. Transcribe the exact words spoken in original script or phonetics. Output ONLY transcribed text."
-        ])
+        stt_response = client.models.generate_content(
+            model='gemini-3.8-flash',
+            contents=[
+                types.Part.from_bytes(
+                    data=audio_bytes,
+                    mime_type="audio/wav",
+                ),
+                "Listen to this walkie-talkie transmission from a Loco Pilot. It can be in English, Tamil, Hindi, Telugu, Malayalam, Kannada, or mixed code-switching. Transcribe the exact words spoken in original script or phonetics. Output ONLY transcribed text."
+            ]
+        )
         
         transcribed_text = stt_response.text.strip() if stt_response.text else "Signal status check, over."
         
@@ -75,20 +83,46 @@ async def transcribe_audio_from_client(file: UploadFile = File(...)):
             os.remove(temp_audio_path)
         raise HTTPException(status_code=500, detail=f"STT Transcription failed: {str(e)}")
 
+def get_or_create_scenario_cache(scenario_id: str, timetable_str: str, instructions_str: str):
+    """Server-side Gemini Context Caching with 24-Hour TTL to eliminate 10,000+ input tokens"""
+    if scenario_id in active_scenario_caches:
+        return active_scenario_caches[scenario_id]
+    
+    try:
+        cache = client.caches.create(
+            model="gemini-3.8-flash",
+            config=types.CreateCachedContentConfig(
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_text(text=f"CRITICAL GROUNDING TIMETABLE:\n{timetable_str}"),
+                            types.Part.from_text(text=f"STATION SPECIFIC INSTRUCTIONS:\n{instructions_str}")
+                        ]
+                    ),
+                ],
+                ttl="86400s", # 24 Hours Cache duration per session
+            )
+        )
+        active_scenario_caches[scenario_id] = cache.name
+        return cache.name
+    except Exception as e:
+        print(f"[CACHE CREATION ERROR]: {e}")
+        return None
+
 @app.post("/generate-chat")
 async def generate_role_chat_response(payload: ChatRequest):
-    """Asynchronous role chat generation with dynamic scenario instructions injection"""
+    """Asynchronous role chat generation utilizing Server-Side Context Caching"""
     try:
-        player_timetable_json = str(payload.timetable)
-        all_traffic_json = str(payload.all_traffic)
+        player_timetable_json = json.dumps(payload.timetable)
+        all_traffic_json = json.dumps(payload.all_traffic)
+        station_inst_json = json.dumps(payload.station_instructions)
         
-        # Format dynamic station instructions cleanly so LLM can read rules for ANY scenario loaded
-        instructions_formatted = ""
-        if payload.station_instructions:
-            for k, v in payload.station_instructions.items():
-                instructions_formatted += f"- {k.replace('_', ' ').upper()}: {v}\n"
-        else:
-            instructions_formatted = "No special station instructions for this scenario. Operate as per standard timetable and signal aspects."
+        # Generate unique hash for this scenario session timetable
+        scenario_id = hashlib.md5((player_timetable_json + station_inst_json).encode()).hexdigest()
+        
+        # Get or create server-side context cache
+        cache_name = get_or_create_scenario_cache(scenario_id, player_timetable_json, station_inst_json)
 
         final_dest = "destination"
         if payload.timetable:
@@ -100,19 +134,13 @@ async def generate_role_chat_response(payload: ChatRequest):
         Final Destination Station: {final_dest}.
         User Preferred Communication Language Option: {payload.selected_language}.
         
-        CRITICAL ACTIVE SCENARIO RULES & STATION INSTRUCTIONS (APPLY THESE DYNAMICALLY):
-        {instructions_formatted}
-        
-        CRITICAL GROUNDING DATABASE (DO NOT DEVIATE):
-        {player_timetable_json}
-        
         ALL ROUTE TRAFFIC & ENROUTE TRAINS DATABASE:
         {all_traffic_json}
         
         Stations already communicated so far: {payload.communicated}
 
         CRITICAL INSTRUCTIONS FOR NATURAL PRONUNCIATION & ACCURACY:
-        1. **ZERO HALLUCINATION RULE:** Read timings and station names EXCLUSIVELY from the "CRITICAL GROUNDING DATABASE". Never invent times!
+        1. **ZERO HALLUCINATION RULE:** Read timings and station names EXCLUSIVELY from the cached timetable. Never invent times!
         2. **TRAIN NUMBER PRONUNCIATION RULE:** When mentioning any train number (e.g., 12605), you MUST pronounce it in English as **single, individual digits** word-by-word (e.g., "One Two Six Zero Five"). Never read train numbers as combined numbers like "Twelve thousand"!
         3. **TRAIN NUMBER CONTEXT:** ONLY mention train numbers when the Loco Pilot explicitly asks for train status, train numbers, or enroute traffic details. Do NOT repeat the train number for standard clearance, signals, or timetable halts.
         4. **NO MARKDOWN:** NEVER use markdown asterisks (*), bold (**), or hashtags (#). Output plain text ONLY.
@@ -122,7 +150,19 @@ async def generate_role_chat_response(payload: ChatRequest):
         8. Keep responses authoritative, professional, and short (1-2 sentences max). Always end your response with 'Over'.
         """
 
-        response = model.generate_content([sys_prompt, f"Loco Pilot {payload.lp_name}: {payload.speech_text}"])
+        # Build request config with cached content if successfully created
+        config_params = {
+            "system_instruction": sys_prompt
+        }
+        if cache_name:
+            config_params["cached_content"] = cache_name
+
+        response = client.models.generate_content(
+            model='gemini-3.8-flash',
+            contents=f"Loco Pilot {payload.lp_name}: {payload.speech_text}",
+            config=types.GenerateContentConfig(**config_params)
+        )
+        
         raw_reply = response.text if response.text else "Radio signal acknowledged, over."
         
         import re
@@ -188,7 +228,6 @@ async def generate_voice_assistant_response(payload: VoiceRequest, authorization
     except Exception as e:
         print(f"[CREDIT DEDUCT ERROR]: {e}")
 
-    from fastapi.responses import Response
     return Response(content=tts_responses.content, media_type="audio/mpeg")
 
 @app.post("/add-credits")
@@ -206,4 +245,4 @@ async def add_user_credits_api(payload: TopupRequest):
 
 @app.get("/")
 def home():
-    return {"status": "TufTactics Semaphore-Protected Async Backend is live! 🚂🔥"}
+    return {"status": "TufTactics Semaphore-Protected Async Backend is live with 24-Hour Context Caching! 🚂🔥"}
