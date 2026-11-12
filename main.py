@@ -158,6 +158,7 @@ async def generate_role_chat_response(payload: ChatRequest):
         config_params = {
             "system_instruction": sys_prompt,
             "max_output_tokens": 150,
+            "thinking_config": {"thinking_budget": 0}  # (Ithu model-ku thaguntha maathiri support pannum)
         }
         if cache_name:
             config_params["cached_content"] = cache_name
@@ -251,3 +252,4 @@ async def add_user_credits_api(payload: TopupRequest):
 @app.get("/")
 def home():
     return {"status": "TufTactics Semaphore-Protected Async Backend is live with 24-Hour Context Caching! 🚂🔥"}
+    
