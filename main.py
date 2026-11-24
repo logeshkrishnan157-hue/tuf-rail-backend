@@ -1,8 +1,8 @@
 import os
+import re
 import shutil
 import asyncio
 import httpx
-import hashlib
 import json
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Response
 from pydantic import BaseModel
@@ -11,7 +11,7 @@ from supabase import create_client, Client
 from google import genai
 from google.genai import types
 
-load_dotenv() # Loads keys from .env file
+load_dotenv()  # Loads keys from .env file
 
 app = FastAPI(title="TufTactics Rail Assistant Safe-Concurrency Backend")
 
@@ -25,18 +25,18 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Dictionary to manage active server-side caches per scenario session
-active_scenario_caches = {}
-
 # 🔒 SEMAPHORE GUARD: Restricts max concurrent calls to ElevenLabs matching your Creator Plan (5)
 ELEVENLABS_SEMAPHORE = asyncio.Semaphore(5)
+
 
 class VoiceRequest(BaseModel):
     text: str
     voice_id: str = "default_voice_id"
 
+
 class ChatRequest(BaseModel):
     role: str
+    gender: str = "Female"  # Optional default so existing .exe works without changes
     speech_text: str
     lp_name: str
     train_name: str
@@ -46,23 +46,25 @@ class ChatRequest(BaseModel):
     station_instructions: dict = {}
     communicated: list
 
+
 class TopupRequest(BaseModel):
     email: str
     credits_to_add: int
 
+
 @app.post("/transcribe-audio")
-async def transcribe_audio_from_client(file: UploadFile = File(...)):
-    """Non-blocking audio transcription using Gemini STT"""
+def transcribe_audio_from_client(file: UploadFile = File(...)):
+    """Threadpool-safe audio transcription using Gemini STT"""
     temp_audio_path = f"temp_{file.filename}"
     try:
         with open(temp_audio_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        
+
         with open(temp_audio_path, "rb") as af:
             audio_bytes = af.read()
 
         stt_response = client.models.generate_content(
-            model='gemini-3.8-flash',
+            model="gemini-3.8-flash",
             contents=[
                 types.Part.from_bytes(
                     data=audio_bytes,
@@ -71,121 +73,92 @@ async def transcribe_audio_from_client(file: UploadFile = File(...)):
                 "Listen to this walkie-talkie transmission from a Loco Pilot. It can be in English, Tamil, Hindi, Telugu, Malayalam, Kannada, or mixed code-switching. Transcribe the exact words spoken in original script or phonetics. Output ONLY transcribed text."
             ]
         )
-        
+
         transcribed_text = stt_response.text.strip() if stt_response.text else "Signal status check, over."
-        
-        if os.path.exists(temp_audio_path):
-            os.remove(temp_audio_path)
-            
         return {"text": transcribed_text}
     except Exception as e:
+        raise HTTPException(status_code=500, detail=f"STT Transcription failed: {str(e)}")
+    finally:
         if os.path.exists(temp_audio_path):
             os.remove(temp_audio_path)
-        raise HTTPException(status_code=500, detail=f"STT Transcription failed: {str(e)}")
 
-def get_or_create_scenario_cache(scenario_id: str, timetable_str: str, instructions_str: str):
-    """Server-side Gemini Context Caching with 24-Hour TTL to eliminate 10,000+ input tokens"""
-    if scenario_id in active_scenario_caches:
-        return active_scenario_caches[scenario_id]
-    
-    try:
-        cache = client.caches.create(
-            model="gemini-3.8-flash",
-            config=types.CreateCachedContentConfig(
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part.from_text(text=f"CRITICAL GROUNDING TIMETABLE:\n{timetable_str}"),
-                            types.Part.from_text(text=f"STATION SPECIFIC INSTRUCTIONS:\n{instructions_str}")
-                        ]
-                    ),
-                ],
-                ttl="86400s", # 24 Hours Cache duration per session
-            )
-        )
-        active_scenario_caches[scenario_id] = cache.name
-        return cache.name
-    except Exception as e:
-        print(f"[CACHE CREATION ERROR]: {e}")
-        return None
 
 @app.post("/generate-chat")
-async def generate_role_chat_response(payload: ChatRequest):
-    """Asynchronous role chat generation utilizing Server-Side Context Caching"""
+def generate_role_chat_response(payload: ChatRequest):
+    """Fast role chat generation with strict railway grounding, mood mirroring & real-time Search/Maps"""
     try:
-        player_timetable_json = json.dumps(payload.timetable)
-        all_traffic_json = json.dumps(payload.all_traffic)
-        station_inst_json = json.dumps(payload.station_instructions)
-        
-        # Generate unique hash for this scenario session timetable
-        scenario_id = hashlib.md5((player_timetable_json + station_inst_json).encode()).hexdigest()
-        
-        # Get or create server-side context cache
-        cache_name = get_or_create_scenario_cache(scenario_id, player_timetable_json, station_inst_json)
+        all_traffic_json = json.dumps(payload.all_traffic, ensure_ascii=False)
+        station_inst_json = json.dumps(payload.station_instructions, ensure_ascii=False)
 
         final_dest = "destination"
         if payload.timetable:
             final_dest = str(payload.timetable[-1].get("station", "destination")).lower()
 
+        is_female = payload.gender.strip().lower() == "female"
+        vibe_rule = (
+            "PERSONALITY (FEMALE CREW): Stay professional on normal railway queries. If the Loco Pilot trolls or teases about driving/railways, playfully roast him back. ONLY if the Loco Pilot initiates sweet, romantic, or flirty talk, respond with charming, clean, witty flirtatious banter. Adapt naturally to any topic (weather, news, exams, health, cinema, songs) while staying in character."
+            if is_female else
+            "PERSONALITY (MALE CREW): Stay professional on normal railway queries. If the Loco Pilot trolls or teases, roast him back like a close Indian Railways buddy. If he gets sentimental or flirty, laugh it off with witty buddy humor. Adapt naturally to any topic (weather, news, exams, health, cinema, songs) while staying in character."
+        )
+
         sys_prompt = f"""
-        You are an authentic Indian Railways {payload.role.upper()}. Loco Pilot name is {payload.lp_name}.
-        Player Train: {payload.train_name}.
-        Final Destination Station: {final_dest}.
-        User Preferred Communication Language Option: {payload.selected_language}.
-        
-        CRITICAL STATION SPECIFIC INSTRUCTIONS & RULES:
-        {station_inst_json}
-        
-        ALL ROUTE TRAFFIC & ENROUTE TRAINS DATABASE:
-        {all_traffic_json}
-        
-        Stations already communicated so far: {payload.communicated}
+You are an authentic, lively Indian Railways {payload.role.upper()} ({payload.gender}) talking on walkie-talkie with Loco Pilot {payload.lp_name}.
+Player Train: {payload.train_name}.
+Final Destination Station: {final_dest}.
+User Preferred Communication Language Option: {payload.selected_language}.
 
-        CRITICAL INSTRUCTIONS FOR NATURAL PRONUNCIATION & ACCURACY:
-        1. **ZERO HALLUCINATION RULE:** Read timings, station names, and special rules EXCLUSIVELY from the timetable and station instructions above. Never invent times!
-        2. **STATION INSTRUCTIONS USAGE:** When the Loco Pilot asks about any station or signal (e.g., Chennai Beach starter, Chetpat home signal, Pallavaram signal maintenance, or Tambaram Sanatorium restriction), you MUST read and follow the exact instructions given in the `CRITICAL STATION SPECIFIC INSTRUCTIONS` section!
-        3. **TRAIN NUMBER PRONUNCIATION RULE:** When mentioning any train number (e.g., 12605), you MUST pronounce it in English as **single, individual digits** word-by-word (e.g., "One Two Six Zero Five"). Never read train numbers as combined numbers like "Twelve thousand"!
-        4. **TRAIN NUMBER CONTEXT:** ONLY mention train numbers when the Loco Pilot explicitly asks for train status, train numbers, or enroute traffic details. Do NOT repeat the train number for standard clearance, signals, or timetable halts.
-        5. **NO MARKDOWN:** NEVER use markdown asterisks (*), bold (**), or hashtags (#). Output plain text ONLY.
-        6. **STATION NAMES & HALTS:** Print all station names and stopping halts in the **NATIVE SCRIPT** of the selected regional language (e.g., in Tamil: "தாம்பரம்", "செங்கல்பட்டு") so ElevenLabs gives a true native local accent.
-        7. **TIME & HRS:** Always expand time into the English word **"Hours"** (e.g. "16:07 Hours").
-        8. **TECHNICAL RAILWAY TERMS:** Keep all technical railway words strictly in English (e.g., Line clear, starter signal, over, section, block, point, loop line, brake pipe, green aspect, red aspect, proceed, platform).
-        9. Keep responses authoritative, professional, and short (1-2 sentences max). Always end your response with 'Over'.
-        """
+CRITICAL STATION SPECIFIC INSTRUCTIONS & RULES:
+{station_inst_json}
 
-        # Build request config with cached content if successfully created
-        config_params = {
-            "system_instruction": sys_prompt,
-            "max_output_tokens": 150,
-            "thinking_config": {"thinking_budget": 0}  # (Ithu model-ku thaguntha maathiri support pannum)
-        }
-        if cache_name:
-            config_params["cached_content"] = cache_name
+ALL ROUTE TRAFFIC & ENROUTE TRAINS DATABASE (includes player train with is_player=true):
+{all_traffic_json}
+
+Stations already communicated so far: {payload.communicated}
+
+STRICT OPERATIONAL & FORMAT RULES:
+1. ZERO HALLUCINATION RULE: Read timings, station names, halts, speed limits, and special rules EXCLUSIVELY from the timetable and station instructions above. Never invent times!
+2. {vibe_rule}
+3. 100% CLEAN & FAMILY-SAFE: Keep all roasting, trolling, and flirting wholesome and PG-13. NEVER use vulgar, explicit, abusive, or bad words.
+4. REAL-TIME KNOWLEDGE: Use Google Search or Google Maps tools when asked about live weather, news, scores, or real-world places near stations.
+5. TRAIN NUMBER PRONUNCIATION RULE: ONLY mention train numbers when the Loco Pilot explicitly asks for train status, train numbers, or enroute traffic details. Pronounce train numbers in English as single, individual digits word-by-word (e.g., "One Two Six Six Six", never "Twelve thousand").
+6. NO MARKDOWN: NEVER use markdown asterisks (*), bold (**), or hashtags (#). Output plain text ONLY.
+7. STATION NAMES & HALTS: Write all station names and stopping halts in the NATIVE SCRIPT of {payload.selected_language} (e.g., in Tamil: "விழுப்புரம்", "தாம்பரம்") so ElevenLabs gives a true native local accent.
+8. TIME & TECHNICAL TERMS: Always expand time into the English word "Hours" (e.g., "16:46 Hours"). Keep all technical railway words strictly in English (e.g., Line clear, starter signal, home signal, over, section, block, point, loop line, brake pipe, green aspect, red aspect, proceed, platform).
+9. Keep responses punchy and short (1-2 sentences max). Always end your response with "Over".
+"""
 
         response = client.models.generate_content(
-            model='gemini-3.8-flash',
+            model="gemini-3.8-flash",
             contents=f"Loco Pilot {payload.lp_name}: {payload.speech_text}",
-            config=types.GenerateContentConfig(**config_params)
+            config=types.GenerateContentConfig(
+                system_instruction=sys_prompt,
+                max_output_tokens=150,
+                temperature=0.85,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                tools=[
+                    types.Tool(google_search=types.GoogleSearch()),
+                    types.Tool(google_maps=types.GoogleMaps())
+                ]
+            )
         )
-        
+
         raw_reply = response.text if response.text else "Radio signal acknowledged, over."
-        
-        import re
-        cleaned = re.sub(r'\*+', '', raw_reply)
-        cleaned = re.sub(r'#+', '', cleaned)
-        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+        cleaned = re.sub(r"\*+", "", raw_reply)
+        cleaned = re.sub(r"#+", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
         return {"reply": cleaned}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Chat generation failed: {str(e)}")
+
 
 @app.post("/generate-voice")
 async def generate_voice_assistant_response(payload: VoiceRequest, authorization: str = Header(None)):
     """Async voice generation protected with ElevenLabs Concurrency Semaphore (Max 5)"""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid license token")
-    
+
     license_key = authorization.split(" ")[1]
 
     # 1. Verify License & Check Credits via Supabase RPC
@@ -193,7 +166,7 @@ async def generate_voice_assistant_response(payload: VoiceRequest, authorization
         user_res = supabase.rpc("verify_license_key", {"p_key": license_key.strip()}).execute()
         if not user_res or not user_res.data:
             raise HTTPException(status_code=403, detail="Invalid License Key")
-        
+
         user_data = user_res.data[0]
         user_email = user_data.get("user_email") or user_data.get("email")
         credits = int(user_data.get("credits", 0))
@@ -203,7 +176,7 @@ async def generate_voice_assistant_response(payload: VoiceRequest, authorization
     if credits <= 0:
         raise HTTPException(status_code=402, detail="Insufficient credits. Please top-up on TufScenarios hub.")
 
-    ai_response_text = payload.text 
+    ai_response_text = payload.text
 
     elevenlabs_url = f"https://api.elevenlabs.io/v1/text-to-speech/{payload.voice_id}"
     headers = {
@@ -222,9 +195,9 @@ async def generate_voice_assistant_response(payload: VoiceRequest, authorization
 
     # 🔒 ACQUIRE SEMAPHORE: Ensures maximum 5 concurrent calls hit ElevenLabs at any exact microsecond
     async with ELEVENLABS_SEMAPHORE:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            tts_responses = await client.post(elevenlabs_url, json=body, headers=headers)
-    
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
+            tts_responses = await http_client.post(elevenlabs_url, json=body, headers=headers)
+
     if tts_responses.status_code != 200:
         raise HTTPException(status_code=500, detail=f"Failed to generate audio from ElevenLabs: {tts_responses.text}")
 
@@ -236,20 +209,21 @@ async def generate_voice_assistant_response(payload: VoiceRequest, authorization
 
     return Response(content=tts_responses.content, media_type="audio/mpeg")
 
+
 @app.post("/add-credits")
-async def add_user_credits_api(payload: TopupRequest):
+def add_user_credits_api(payload: TopupRequest):
     """Secure endpoint to add credits upon successful Cashfree payment using Supabase RPC upsert safety"""
     try:
-        res = supabase.rpc("add_user_credits_secure", {
+        supabase.rpc("add_user_credits_secure", {
             "p_email": payload.email,
             "p_amount": payload.credits_to_add
         }).execute()
-        
+
         return {"status": "success", "message": f"Successfully added {payload.credits_to_add} credits for {payload.email}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to add credits: {str(e)}")
 
+
 @app.get("/")
 def home():
-    return {"status": "TufTactics Semaphore-Protected Async Backend is live with 24-Hour Context Caching! 🚂🔥"}
-    
+    return {"status": "TufTactics Semaphore-Protected Async Backend is live with Real-Time Search, Maps & Dynamic Crew Banter! 🚂🔥"}
