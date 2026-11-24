@@ -53,9 +53,38 @@ class TopupRequest(BaseModel):
     credits_to_add: int
 
 
+def call_gemini_with_fallback(contents, sys_prompt=None, use_search=False):
+    """Primary: gemini-3.8-flash | Instant 503 Fallback: gemini-3.5-flash-lite"""
+    tools = [types.Tool(google_search=types.GoogleSearch())] if use_search else None
+    try:
+        return client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=sys_prompt,
+                max_output_tokens=600,
+                temperature=0.85,
+                tools=tools
+            )
+        )
+    except Exception as e:
+        if "503" in str(e) or "UNAVAILABLE" in str(e):
+            print("[503 SPIKE]: Switching seamlessly to gemini-3.5-flash-lite...")
+            return client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=sys_prompt,
+                    max_output_tokens=600,
+                    tools=tools
+                )
+            )
+        raise e
+
+
 @app.post("/transcribe-audio")
 def transcribe_audio_from_client(file: UploadFile = File(...)):
-    """Threadpool-safe audio transcription using Gemini STT"""
+    """Threadpool-safe audio transcription using Gemini STT with 503 resilience"""
     temp_audio_path = f"temp_{file.filename}"
     try:
         with open(temp_audio_path, "wb") as buffer:
@@ -64,16 +93,15 @@ def transcribe_audio_from_client(file: UploadFile = File(...)):
         with open(temp_audio_path, "rb") as af:
             audio_bytes = af.read()
 
-        stt_response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=[
-                types.Part.from_bytes(
-                    data=audio_bytes,
-                    mime_type="audio/wav",
-                ),
-                "Listen to this walkie-talkie transmission from a Loco Pilot. It can be in English, Tamil, Hindi, Telugu, Malayalam, Kannada, or mixed code-switching. Transcribe the exact words spoken in original script or phonetics. Output ONLY transcribed text."
-            ]
-        )
+        stt_contents = [
+            types.Part.from_bytes(
+                data=audio_bytes,
+                mime_type="audio/wav",
+            ),
+            "Listen to this walkie-talkie transmission from a Loco Pilot. It can be in English, Tamil, Hindi, Telugu, Malayalam, Kannada, or mixed code-switching. Transcribe the exact words spoken in original script or phonetics. Output ONLY transcribed text."
+        ]
+
+        stt_response = call_gemini_with_fallback(contents=stt_contents, use_search=False)
 
         transcribed_text = stt_response.text.strip() if stt_response.text else "Signal status check, over."
         return {"text": transcribed_text}
@@ -87,7 +115,7 @@ def transcribe_audio_from_client(file: UploadFile = File(...)):
 
 @app.post("/generate-chat")
 def generate_role_chat_response(payload: ChatRequest):
-    """Fast role chat generation with strict railway grounding, mood mirroring & Google Search"""
+    """Fast role chat generation with full token headroom, strict grounding & 503 resilience"""
     try:
         all_traffic_json = json.dumps(payload.all_traffic, ensure_ascii=False)
         station_inst_json = json.dumps(payload.station_instructions, ensure_ascii=False)
@@ -131,16 +159,10 @@ STRICT OPERATIONAL & FORMAT RULES:
 
         user_msg = f"Loco Pilot {payload.lp_name}: {payload.speech_text}"
 
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
+        response = call_gemini_with_fallback(
             contents=user_msg,
-            config=types.GenerateContentConfig(
-                system_instruction=sys_prompt,
-                max_output_tokens=150,
-                temperature=0.85,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-                tools=[types.Tool(google_search=types.GoogleSearch())]
-            )
+            sys_prompt=sys_prompt,
+            use_search=True
         )
 
         raw_reply = response.text if (response and response.text) else "Radio signal acknowledged, over."
