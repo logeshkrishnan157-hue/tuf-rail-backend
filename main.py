@@ -14,13 +14,18 @@ from google.genai import types
 
 load_dotenv()  # Loads keys from .env file
 
-app = FastAPI(title="TufTactics Rail Assistant Safe-Concurrency Backend")
+app = FastAPI(
+    title="TufTactics Rail Assistant Safe-Concurrency Backend",
+    docs_url=None,
+    redoc_url=None
+)
 
 # Securely load credentials from environment variables
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY")
 
 # Initialize Supabase & GenAI Client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
@@ -316,8 +321,11 @@ async def generate_voice_assistant_response(payload: VoiceRequest, authorization
 
 
 @app.post("/add-credits")
-def add_user_credits_api(payload: TopupRequest):
-    """Secure endpoint to add credits upon successful Cashfree payment using Supabase RPC upsert safety"""
+def add_user_credits_api(payload: TopupRequest, x_admin_secret: str = Header(None)):
+    """Secure endpoint to add credits upon successful payment using Supabase RPC upsert safety"""
+    if not ADMIN_SECRET_KEY or x_admin_secret != ADMIN_SECRET_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized top-up request")
+
     try:
         supabase.rpc("add_user_credits_secure", {
             "p_email": payload.email,
