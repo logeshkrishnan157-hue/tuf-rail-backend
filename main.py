@@ -2,6 +2,7 @@ import os
 import re
 import shutil
 import asyncio
+import traceback
 import httpx
 import json
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Response
@@ -36,7 +37,7 @@ class VoiceRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     role: str
-    gender: str = "Female"  # Optional default so existing .exe works without changes
+    gender: str = "Female"
     speech_text: str
     lp_name: str
     train_name: str
@@ -77,6 +78,7 @@ def transcribe_audio_from_client(file: UploadFile = File(...)):
         transcribed_text = stt_response.text.strip() if stt_response.text else "Signal status check, over."
         return {"text": transcribed_text}
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"STT Transcription failed: {str(e)}")
     finally:
         if os.path.exists(temp_audio_path):
@@ -85,7 +87,7 @@ def transcribe_audio_from_client(file: UploadFile = File(...)):
 
 @app.post("/generate-chat")
 def generate_role_chat_response(payload: ChatRequest):
-    """Fast role chat generation with strict railway grounding, mood mirroring & real-time Search/Maps"""
+    """Fast role chat generation with strict railway grounding, mood mirroring & Google Search"""
     try:
         all_traffic_json = json.dumps(payload.all_traffic, ensure_ascii=False)
         station_inst_json = json.dumps(payload.station_instructions, ensure_ascii=False)
@@ -119,7 +121,7 @@ STRICT OPERATIONAL & FORMAT RULES:
 1. ZERO HALLUCINATION RULE: Read timings, station names, halts, speed limits, and special rules EXCLUSIVELY from the timetable and station instructions above. Never invent times!
 2. {vibe_rule}
 3. 100% CLEAN & FAMILY-SAFE: Keep all roasting, trolling, and flirting wholesome and PG-13. NEVER use vulgar, explicit, abusive, or bad words.
-4. REAL-TIME KNOWLEDGE: Use Google Search or Google Maps tools when asked about live weather, news, scores, or real-world places near stations.
+4. REAL-TIME KNOWLEDGE: Use Google Search only when asked about live weather, news, scores, or real-world places near stations.
 5. TRAIN NUMBER PRONUNCIATION RULE: ONLY mention train numbers when the Loco Pilot explicitly asks for train status, train numbers, or enroute traffic details. Pronounce train numbers in English as single, individual digits word-by-word (e.g., "One Two Six Six Six", never "Twelve thousand").
 6. NO MARKDOWN: NEVER use markdown asterisks (*), bold (**), or hashtags (#). Output plain text ONLY.
 7. STATION NAMES & HALTS: Write all station names and stopping halts in the NATIVE SCRIPT of {payload.selected_language} (e.g., in Tamil: "விழுப்புரம்", "தாம்பரம்") so ElevenLabs gives a true native local accent.
@@ -127,22 +129,21 @@ STRICT OPERATIONAL & FORMAT RULES:
 9. Keep responses punchy and short (1-2 sentences max). Always end your response with "Over".
 """
 
+        user_msg = f"Loco Pilot {payload.lp_name}: {payload.speech_text}"
+
         response = client.models.generate_content(
             model="gemini-3.8-flash",
-            contents=f"Loco Pilot {payload.lp_name}: {payload.speech_text}",
+            contents=user_msg,
             config=types.GenerateContentConfig(
                 system_instruction=sys_prompt,
                 max_output_tokens=150,
                 temperature=0.85,
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
-                tools=[
-                    types.Tool(google_search=types.GoogleSearch()),
-                    types.Tool(google_maps=types.GoogleMaps())
-                ]
+                tools=[types.Tool(google_search=types.GoogleSearch())]
             )
         )
 
-        raw_reply = response.text if response.text else "Radio signal acknowledged, over."
+        raw_reply = response.text if (response and response.text) else "Radio signal acknowledged, over."
 
         cleaned = re.sub(r"\*+", "", raw_reply)
         cleaned = re.sub(r"#+", "", cleaned)
@@ -150,6 +151,7 @@ STRICT OPERATIONAL & FORMAT RULES:
 
         return {"reply": cleaned}
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Chat generation failed: {str(e)}")
 
 
@@ -226,4 +228,4 @@ def add_user_credits_api(payload: TopupRequest):
 
 @app.get("/")
 def home():
-    return {"status": "TufTactics Semaphore-Protected Async Backend is live with Real-Time Search, Maps & Dynamic Crew Banter! 🚂🔥"}
+    return {"status": "TufTactics Semaphore-Protected Async Backend is live with Real-Time Search & Dynamic Crew Banter! 🚂🔥"}
