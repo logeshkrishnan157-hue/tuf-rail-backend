@@ -54,7 +54,7 @@ class TopupRequest(BaseModel):
 
 
 def call_gemini_with_fallback(contents, sys_prompt=None, use_search=False):
-    """Primary: gemini-3.8-flash | Instant 503 Fallback: gemini-3.5-flash-lite"""
+    """Primary: gemini-3.8-flash (thinking=0) | Instant 503 Fallback: gemini-3.5-flash-lite"""
     tools = [types.Tool(google_search=types.GoogleSearch())] if use_search else None
     try:
         return client.models.generate_content(
@@ -62,8 +62,9 @@ def call_gemini_with_fallback(contents, sys_prompt=None, use_search=False):
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=sys_prompt,
-                max_output_tokens=600,
+                max_output_tokens=1024,
                 temperature=0.85,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
                 tools=tools
             )
         )
@@ -75,7 +76,7 @@ def call_gemini_with_fallback(contents, sys_prompt=None, use_search=False):
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=sys_prompt,
-                    max_output_tokens=600,
+                    max_output_tokens=1024,
                     tools=tools
                 )
             )
@@ -115,7 +116,7 @@ def transcribe_audio_from_client(file: UploadFile = File(...)):
 
 @app.post("/generate-chat")
 def generate_role_chat_response(payload: ChatRequest):
-    """Fast role chat generation with full token headroom, strict grounding & 503 resilience"""
+    """Fast role chat generation with thinking=0, full token headroom, strict grounding & 503 resilience"""
     try:
         all_traffic_json = json.dumps(payload.all_traffic, ensure_ascii=False)
         station_inst_json = json.dumps(payload.station_instructions, ensure_ascii=False)
