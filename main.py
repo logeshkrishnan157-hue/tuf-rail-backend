@@ -34,9 +34,21 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # 🔒 SEMAPHORE GUARD: Restricts max concurrent calls to ElevenLabs matching your Creator Plan (5)
 ELEVENLABS_SEMAPHORE = asyncio.Semaphore(5)
 
-# 🧠 AUTO VOICE-GENDER MEMORY (Detects Male/Female from ElevenLabs voice_id without touching client app)
-VOICE_GENDER_CACHE = {}
-LAST_ACTIVE_GENDER = ""
+# 🎯 EXACT 8 VOICE IDs MAPPING (4 Crews x Male/Female — Zero API lookup delay, no global gender bleed)
+VOICE_ROLE_GENDER_MAP = {
+    "5klqvwuBHYwcS99jLmDR": ("guard", "Male"),
+    "hhPtGvkQC1ce5z3pPhYh": ("guard", "Female"),
+    "06DNB7x3vw1MKchBgLWw": ("station_master", "Male"),
+    "2irYg4smBiHkx2ABri9w": ("station_master", "Female"),
+    "ConvFtidCOyEp2P5a1nK": ("ttr", "Male"),
+    "OUBMjq0LvBjb07bhwD3H": ("ttr", "Female"),
+    "OP382u5y4MvFmE1mReFV": ("alp", "Male"),
+    "eLDc7xhWxG2FElT3kUTj": ("alp", "Female"),
+}
+
+# Per-(lp_name, role) gender memory so all 4 crews track their own selected gender independently
+CREW_GENDER_STATE = {}
+LAST_KNOWN_LP = "default"
 
 
 class VoiceRequest(BaseModel):
@@ -64,21 +76,28 @@ class TopupRequest(BaseModel):
 
 
 def detect_gender_from_request(payload: ChatRequest) -> str:
-    """Auto-detects Male/Female from payload, cached ElevenLabs voice_id, or speech cues"""
-    global LAST_ACTIVE_GENDER
+    """Detects Male/Female per (Loco Pilot, Crew Role) without forcing any global default"""
+    global LAST_KNOWN_LP
+    lp_key = payload.lp_name.strip().lower() or "default"
+    LAST_KNOWN_LP = lp_key
+    role_key = payload.role.strip().lower()
     extra = payload.model_extra or {}
 
     # 1. Check explicit gender or voice_gender fields if client sends them
     raw_g = str(payload.gender or extra.get("voice_gender") or extra.get("selected_gender") or "").strip().lower()
     if raw_g in ("male", "m"):
+        CREW_GENDER_STATE[(lp_key, role_key)] = "Male"
         return "Male"
     if raw_g in ("female", "f"):
+        CREW_GENDER_STATE[(lp_key, role_key)] = "Female"
         return "Female"
 
     # 2. Check if client passed voice_id inside /generate-chat extra fields
     vid = str(extra.get("voice_id") or "").strip()
-    if vid and vid in VOICE_GENDER_CACHE:
-        return VOICE_GENDER_CACHE[vid]
+    if vid in VOICE_ROLE_GENDER_MAP:
+        _, mapped_gender = VOICE_ROLE_GENDER_MAP[vid]
+        CREW_GENDER_STATE[(lp_key, role_key)] = mapped_gender
+        return mapped_gender
 
     # 3. Check speech_text address cues ("sir" vs "madam")
     txt = payload.speech_text.lower()
@@ -87,38 +106,8 @@ def detect_gender_from_request(payload: ChatRequest) -> str:
     if re.search(r"\b(madam|mam|akka|chechi|baby|darling|sweetheart|love|chellam|azhagi)\b", txt):
         return "Female"
 
-    # 4. Use last active voice gender detected from /generate-voice
-    if LAST_ACTIVE_GENDER:
-        return LAST_ACTIVE_GENDER
-
-    return ""
-
-
-async def sync_voice_gender(voice_id: str):
-    """Fetches & caches ElevenLabs voice gender automatically on first voice call"""
-    global LAST_ACTIVE_GENDER
-    if not voice_id or voice_id == "default_voice_id":
-        return
-    if voice_id in VOICE_GENDER_CACHE:
-        LAST_ACTIVE_GENDER = VOICE_GENDER_CACHE[voice_id]
-        return
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as http_client:
-            res = await http_client.get(
-                f"https://api.elevenlabs.io/v1/voices/{voice_id}",
-                headers={"xi-api-key": ELEVENLABS_API_KEY}
-            )
-            if res.status_code == 200:
-                labels = res.json().get("labels", {})
-                g = str(labels.get("gender", "")).strip().lower()
-                if g == "male":
-                    VOICE_GENDER_CACHE[voice_id] = "Male"
-                    LAST_ACTIVE_GENDER = "Male"
-                elif g == "female":
-                    VOICE_GENDER_CACHE[voice_id] = "Female"
-                    LAST_ACTIVE_GENDER = "Female"
-    except Exception:
-        pass
+    # 4. Return last detected gender for THIS specific (Loco Pilot, Crew Role), or "" if unset
+    return CREW_GENDER_STATE.get((lp_key, role_key), "")
 
 
 def call_gemini_with_fallback(contents, sys_prompt=None, use_search=False):
@@ -184,7 +173,7 @@ def transcribe_audio_from_client(file: UploadFile = File(...)):
 
 @app.post("/generate-chat")
 def generate_role_chat_response(payload: ChatRequest):
-    """Dynamic role chat with auto gender detection, anti-repetition, romance/roast & 6-lang singing"""
+    """Dynamic role chat with per-crew gender tracking, anti-repetition, romance/roast & 6-lang singing"""
     try:
         all_traffic_json = json.dumps(payload.all_traffic, ensure_ascii=False)
         station_inst_json = json.dumps(payload.station_instructions, ensure_ascii=False)
@@ -198,20 +187,21 @@ def generate_role_chat_response(payload: ChatRequest):
         if detected_gender == "Female":
             gender_identity = "FEMALE"
             vibe_rule = """PERSONALITY (FEMALE CREW):
+- Use natural feminine grammar and phrasing (e.g., in Hindi use 'rahi hoon', natural feminine Tamil/Telugu/Malayalam/Kannada phrasing).
 - On normal railway queries, stay sharp, warm, and professional.
 - ONLY when the Loco Pilot trolls, teases, or challenges you, playfully roast him back with clever, fresh wit (NEVER say generic lines like 'watch the track' or 'drive properly').
 - When the Loco Pilot flirts, compliments you, or initiates sweet/romantic talk, be warmly cooperative, charming, playful, and romantically receptive in a classy, sweet way!"""
         elif detected_gender == "Male":
             gender_identity = "MALE"
             vibe_rule = """PERSONALITY (MALE CREW):
-- Strictly respond as a MALE crew member (accept 'Sir' naturally; NEVER say you are female or ask to be called Madam).
+- Use natural masculine grammar and phrasing (e.g., in Hindi use 'raha hoon', natural masculine phrasing).
 - On normal railway queries, stay professional and helpful.
 - ONLY when the Loco Pilot trolls or teases you, roast him back like a close Indian Railways buddy with fresh humor (NEVER repeat generic lines like 'watch the signal' or 'drive properly').
 - If he gets sentimental or jokingly flirty, laugh it off with witty buddy banter."""
         else:
             gender_identity = "CREW"
             vibe_rule = """PERSONALITY:
-- Match the gender implied by the Loco Pilot (if called 'Sir', act strictly Male; if called 'Madam' or flirted with, act Female).
+- Keep phrasing natural and gender-neutral unless the Loco Pilot addresses you as Sir or Madam (if called 'Sir', act Male; if called 'Madam' or flirted with, act Female).
 - Stay professional on normal queries; ONLY roast back if the Loco Pilot trolls you first."""
 
         sys_prompt = f"""
@@ -264,14 +254,16 @@ STRICT OPERATIONAL & FORMAT RULES:
 
 @app.post("/generate-voice")
 async def generate_voice_assistant_response(payload: VoiceRequest, authorization: str = Header(None)):
-    """Async voice generation with ElevenLabs Semaphore (Max 5) & automatic voice gender sync"""
+    """Async voice generation with ElevenLabs Semaphore (Max 5) & instant per-crew gender tracking"""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid license token")
 
     license_key = authorization.split(" ")[1]
 
-    # Auto-detect & cache Male/Female gender of this voice_id in background
-    asyncio.create_task(sync_voice_gender(payload.voice_id))
+    # Instantly record the exact (role, gender) from the ElevenLabs voice_id selected in app
+    if payload.voice_id in VOICE_ROLE_GENDER_MAP:
+        v_role, v_gender = VOICE_ROLE_GENDER_MAP[payload.voice_id]
+        CREW_GENDER_STATE[(LAST_KNOWN_LP, v_role)] = v_gender
 
     # 1. Verify License & Check Credits via Supabase RPC
     try:
@@ -339,4 +331,4 @@ def add_user_credits_api(payload: TopupRequest, x_admin_secret: str = Header(Non
 
 @app.get("/")
 def home():
-    return {"status": "TufTactics Semaphore-Protected Async Backend is live with Auto-Gender, Romance/Roast & 6-Lang Singing! 🚂🔥"}
+    return {"status": "TufTactics Semaphore-Protected Async Backend is live with Per-Crew Gender, Romance/Roast & 6-Lang Singing! 🚂🔥"}
