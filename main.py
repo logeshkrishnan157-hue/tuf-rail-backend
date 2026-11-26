@@ -1,12 +1,13 @@
 import os
 import re
-import shutil
+import time
 import asyncio
 import traceback
+from collections import defaultdict, deque
 import httpx
 import json
-from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Response
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Response, Request
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from google import genai
@@ -34,36 +35,28 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # 🔒 SEMAPHORE GUARD: Restricts max concurrent calls to ElevenLabs matching your Creator Plan (5)
 ELEVENLABS_SEMAPHORE = asyncio.Semaphore(5)
 
-# 🎯 EXACT 8 VOICE IDs MAPPING (4 Crews x Male/Female — Zero API lookup delay, no global gender bleed)
-VOICE_ROLE_GENDER_MAP = {
-    "5klqvwuBHYwcS99jLmDR": ("guard", "Male"),
-    "hhPtGvkQC1ce5z3pPhYh": ("guard", "Female"),
-    "06DNB7x3vw1MKchBgLWw": ("station_master", "Male"),
-    "2irYg4smBiHkx2ABri9w": ("station_master", "Female"),
-    "ConvFtidCOyEp2P5a1nK": ("ttr", "Male"),
-    "OUBMjq0LvBjb07bhwD3H": ("ttr", "Female"),
-    "OP382u5y4MvFmE1mReFV": ("alp", "Male"),
-    "eLDc7xhWxG2FElT3kUTj": ("alp", "Female"),
-}
+# 🛡️ RATE LIMIT & PER-USER GENDER MEMORY (Zero client changes needed)
+RATE_LIMIT_STORE = defaultdict(deque)
+VOICE_GENDER_CACHE = {}
+IP_GENDER_CACHE = {}
 
-# Per-(lp_name, role) gender memory so all 4 crews track their own selected gender independently
-CREW_GENDER_STATE = {}
-LAST_KNOWN_LP = "default"
+MAX_AUDIO_BYTES = 3 * 1024 * 1024  # 3 MB max walkie-talkie audio
+MAX_REQUESTS_PER_MIN = 18          # Max 18 PTT calls per minute per IP
 
 
 class VoiceRequest(BaseModel):
-    text: str
+    text: str = Field(..., min_length=1, max_length=1000)
     voice_id: str = "default_voice_id"
 
 
 class ChatRequest(BaseModel):
     model_config = {"extra": "allow"}  # Accepts any extra fields sent by client app
-    role: str
+    role: str = Field(..., min_length=2, max_length=50)
     gender: str = ""
-    speech_text: str
-    lp_name: str
-    train_name: str
-    selected_language: str
+    speech_text: str = Field(..., min_length=1, max_length=600)
+    lp_name: str = Field(..., min_length=1, max_length=80)
+    train_name: str = Field(..., min_length=1, max_length=120)
+    selected_language: str = Field(..., min_length=2, max_length=30)
     timetable: list
     all_traffic: list
     station_instructions: dict = {}
@@ -75,29 +68,41 @@ class TopupRequest(BaseModel):
     credits_to_add: int
 
 
-def detect_gender_from_request(payload: ChatRequest) -> str:
-    """Detects Male/Female per (Loco Pilot, Crew Role) without forcing any global default"""
-    global LAST_KNOWN_LP
-    lp_key = payload.lp_name.strip().lower() or "default"
-    LAST_KNOWN_LP = lp_key
-    role_key = payload.role.strip().lower()
+def get_client_ip(request: Request) -> str:
+    """Extracts real client IP behind Render proxy"""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def enforce_rate_limit(client_ip: str, bucket: str):
+    """Blocks automated API spam/drain without affecting normal gameplay"""
+    now = time.time()
+    key = f"{bucket}:{client_ip}"
+    timestamps = RATE_LIMIT_STORE[key]
+    while timestamps and now - timestamps[0] > 60:
+        timestamps.popleft()
+    if len(timestamps) >= MAX_REQUESTS_PER_MIN:
+        raise HTTPException(status_code=429, detail="Too many radio transmissions. Please wait a few seconds.")
+    timestamps.append(now)
+
+
+def detect_gender_from_request(payload: ChatRequest, client_ip: str) -> str:
+    """Auto-detects Male/Female per user IP without colliding across concurrent users"""
     extra = payload.model_extra or {}
 
     # 1. Check explicit gender or voice_gender fields if client sends them
     raw_g = str(payload.gender or extra.get("voice_gender") or extra.get("selected_gender") or "").strip().lower()
     if raw_g in ("male", "m"):
-        CREW_GENDER_STATE[(lp_key, role_key)] = "Male"
         return "Male"
     if raw_g in ("female", "f"):
-        CREW_GENDER_STATE[(lp_key, role_key)] = "Female"
         return "Female"
 
     # 2. Check if client passed voice_id inside /generate-chat extra fields
     vid = str(extra.get("voice_id") or "").strip()
-    if vid in VOICE_ROLE_GENDER_MAP:
-        _, mapped_gender = VOICE_ROLE_GENDER_MAP[vid]
-        CREW_GENDER_STATE[(lp_key, role_key)] = mapped_gender
-        return mapped_gender
+    if vid and vid in VOICE_GENDER_CACHE:
+        return VOICE_GENDER_CACHE[vid]
 
     # 3. Check speech_text address cues ("sir" vs "madam")
     txt = payload.speech_text.lower()
@@ -106,8 +111,37 @@ def detect_gender_from_request(payload: ChatRequest) -> str:
     if re.search(r"\b(madam|mam|akka|chechi|baby|darling|sweetheart|love|chellam|azhagi)\b", txt):
         return "Female"
 
-    # 4. Return last detected gender for THIS specific (Loco Pilot, Crew Role), or "" if unset
-    return CREW_GENDER_STATE.get((lp_key, role_key), "")
+    # 4. Use last active voice gender detected for THIS specific user IP
+    if client_ip in IP_GENDER_CACHE:
+        return IP_GENDER_CACHE[client_ip]
+
+    return ""
+
+
+async def sync_voice_gender(voice_id: str, client_ip: str):
+    """Fetches & caches ElevenLabs voice gender per user IP on first voice call"""
+    if not voice_id or voice_id == "default_voice_id":
+        return
+    if voice_id in VOICE_GENDER_CACHE:
+        IP_GENDER_CACHE[client_ip] = VOICE_GENDER_CACHE[voice_id]
+        return
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as http_client:
+            res = await http_client.get(
+                f"https://api.elevenlabs.io/v1/voices/{voice_id}",
+                headers={"xi-api-key": ELEVENLABS_API_KEY}
+            )
+            if res.status_code == 200:
+                labels = res.json().get("labels", {})
+                g = str(labels.get("gender", "")).strip().lower()
+                if g == "male":
+                    VOICE_GENDER_CACHE[voice_id] = "Male"
+                    IP_GENDER_CACHE[client_ip] = "Male"
+                elif g == "female":
+                    VOICE_GENDER_CACHE[voice_id] = "Female"
+                    IP_GENDER_CACHE[client_ip] = "Female"
+    except Exception:
+        pass
 
 
 def call_gemini_with_fallback(contents, sys_prompt=None, use_search=False):
@@ -141,15 +175,17 @@ def call_gemini_with_fallback(contents, sys_prompt=None, use_search=False):
 
 
 @app.post("/transcribe-audio")
-def transcribe_audio_from_client(file: UploadFile = File(...)):
-    """Threadpool-safe audio transcription using Gemini STT with 503 resilience"""
-    temp_audio_path = f"temp_{file.filename}"
-    try:
-        with open(temp_audio_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+async def transcribe_audio_from_client(request: Request, file: UploadFile = File(...)):
+    """In-memory race-safe audio transcription with size guard & IP rate limit"""
+    client_ip = get_client_ip(request)
+    enforce_rate_limit(client_ip, "stt")
 
-        with open(temp_audio_path, "rb") as af:
-            audio_bytes = af.read()
+    try:
+        audio_bytes = await file.read()
+        if not audio_bytes or len(audio_bytes) < 100:
+            raise HTTPException(status_code=400, detail="Empty or corrupted audio clip.")
+        if len(audio_bytes) > MAX_AUDIO_BYTES:
+            raise HTTPException(status_code=413, detail="Audio clip exceeds 3MB limit.")
 
         stt_contents = [
             types.Part.from_bytes(
@@ -159,21 +195,28 @@ def transcribe_audio_from_client(file: UploadFile = File(...)):
             "Listen to this walkie-talkie transmission from a Loco Pilot. It can be in English, Tamil, Hindi, Telugu, Malayalam, Kannada, or mixed code-switching. Transcribe the exact words spoken in original script or phonetics. Output ONLY transcribed text."
         ]
 
-        stt_response = call_gemini_with_fallback(contents=stt_contents, use_search=False)
+        stt_response = await asyncio.to_thread(call_gemini_with_fallback, stt_contents, None, False)
 
         transcribed_text = stt_response.text.strip() if stt_response.text else "Signal status check, over."
         return {"text": transcribed_text}
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"STT Transcription failed: {str(e)}")
-    finally:
-        if os.path.exists(temp_audio_path):
-            os.remove(temp_audio_path)
 
 
 @app.post("/generate-chat")
-def generate_role_chat_response(payload: ChatRequest):
-    """Dynamic role chat with per-crew gender tracking, anti-repetition, romance/roast & 6-lang singing"""
+async def generate_role_chat_response(request: Request, payload: ChatRequest):
+    """Dynamic role chat with IP rate limit, isolated gender memory & payload validation"""
+    client_ip = get_client_ip(request)
+    enforce_rate_limit(client_ip, "chat")
+
+    if not payload.timetable or len(payload.timetable) > 200:
+        raise HTTPException(status_code=400, detail="Invalid timetable context.")
+    if len(payload.all_traffic) > 300:
+        raise HTTPException(status_code=400, detail="Traffic payload too large.")
+
     try:
         all_traffic_json = json.dumps(payload.all_traffic, ensure_ascii=False)
         station_inst_json = json.dumps(payload.station_instructions, ensure_ascii=False)
@@ -182,26 +225,25 @@ def generate_role_chat_response(payload: ChatRequest):
         if payload.timetable:
             final_dest = str(payload.timetable[-1].get("station", "destination")).lower()
 
-        detected_gender = detect_gender_from_request(payload)
+        detected_gender = detect_gender_from_request(payload, client_ip)
 
         if detected_gender == "Female":
             gender_identity = "FEMALE"
             vibe_rule = """PERSONALITY (FEMALE CREW):
-- Use natural feminine grammar and phrasing (e.g., in Hindi use 'rahi hoon', natural feminine Tamil/Telugu/Malayalam/Kannada phrasing).
 - On normal railway queries, stay sharp, warm, and professional.
 - ONLY when the Loco Pilot trolls, teases, or challenges you, playfully roast him back with clever, fresh wit (NEVER say generic lines like 'watch the track' or 'drive properly').
 - When the Loco Pilot flirts, compliments you, or initiates sweet/romantic talk, be warmly cooperative, charming, playful, and romantically receptive in a classy, sweet way!"""
         elif detected_gender == "Male":
             gender_identity = "MALE"
             vibe_rule = """PERSONALITY (MALE CREW):
-- Use natural masculine grammar and phrasing (e.g., in Hindi use 'raha hoon', natural masculine phrasing).
+- Strictly respond as a MALE crew member (accept 'Sir' naturally; NEVER say you are female or ask to be called Madam).
 - On normal railway queries, stay professional and helpful.
 - ONLY when the Loco Pilot trolls or teases you, roast him back like a close Indian Railways buddy with fresh humor (NEVER repeat generic lines like 'watch the signal' or 'drive properly').
 - If he gets sentimental or jokingly flirty, laugh it off with witty buddy banter."""
         else:
             gender_identity = "CREW"
             vibe_rule = """PERSONALITY:
-- Keep phrasing natural and gender-neutral unless the Loco Pilot addresses you as Sir or Madam (if called 'Sir', act Male; if called 'Madam' or flirted with, act Female).
+- Match the gender implied by the Loco Pilot (if called 'Sir', act strictly Male; if called 'Madam' or flirted with, act Female).
 - Stay professional on normal queries; ONLY roast back if the Loco Pilot trolls you first."""
 
         sys_prompt = f"""
@@ -234,11 +276,7 @@ STRICT OPERATIONAL & FORMAT RULES:
 
         user_msg = f"Loco Pilot {payload.lp_name}: {payload.speech_text}"
 
-        response = call_gemini_with_fallback(
-            contents=user_msg,
-            sys_prompt=sys_prompt,
-            use_search=True
-        )
+        response = await asyncio.to_thread(call_gemini_with_fallback, user_msg, sys_prompt, True)
 
         raw_reply = response.text if (response and response.text) else "Radio signal acknowledged, over."
 
@@ -247,33 +285,38 @@ STRICT OPERATIONAL & FORMAT RULES:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
         return {"reply": cleaned}
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Chat generation failed: {str(e)}")
 
 
 @app.post("/generate-voice")
-async def generate_voice_assistant_response(payload: VoiceRequest, authorization: str = Header(None)):
-    """Async voice generation with ElevenLabs Semaphore (Max 5) & instant per-crew gender tracking"""
+async def generate_voice_assistant_response(request: Request, payload: VoiceRequest, authorization: str = Header(None)):
+    """Async voice generation with ElevenLabs Semaphore (Max 5) & per-IP voice gender sync"""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid license token")
 
+    client_ip = get_client_ip(request)
     license_key = authorization.split(" ")[1]
 
-    # Instantly record the exact (role, gender) from the ElevenLabs voice_id selected in app
-    if payload.voice_id in VOICE_ROLE_GENDER_MAP:
-        v_role, v_gender = VOICE_ROLE_GENDER_MAP[payload.voice_id]
-        CREW_GENDER_STATE[(LAST_KNOWN_LP, v_role)] = v_gender
+    # Auto-detect & cache Male/Female gender for this user IP in background
+    asyncio.create_task(sync_voice_gender(payload.voice_id, client_ip))
 
-    # 1. Verify License & Check Credits via Supabase RPC
+    # 1. Verify License & Check Credits via Supabase RPC (Non-blocking)
     try:
-        user_res = supabase.rpc("verify_license_key", {"p_key": license_key.strip()}).execute()
+        user_res = await asyncio.to_thread(
+            lambda: supabase.rpc("verify_license_key", {"p_key": license_key.strip()}).execute()
+        )
         if not user_res or not user_res.data:
             raise HTTPException(status_code=403, detail="Invalid License Key")
 
         user_data = user_res.data[0]
         user_email = user_data.get("user_email") or user_data.get("email")
         credits = int(user_data.get("credits", 0))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=403, detail=f"License verification failed: {str(e)}")
 
@@ -303,9 +346,11 @@ async def generate_voice_assistant_response(payload: VoiceRequest, authorization
     if tts_responses.status_code != 200:
         raise HTTPException(status_code=500, detail=f"Failed to generate audio from ElevenLabs: {tts_responses.text}")
 
-    # 2. Deduct Credit Atomically via Supabase RPC
+    # 2. Deduct Credit Atomically via Supabase RPC (Non-blocking)
     try:
-        supabase.rpc("deduct_user_credit", {"p_email": user_email}).execute()
+        await asyncio.to_thread(
+            lambda: supabase.rpc("deduct_user_credit", {"p_email": user_email}).execute()
+        )
     except Exception as e:
         print(f"[CREDIT DEDUCT ERROR]: {e}")
 
@@ -331,4 +376,4 @@ def add_user_credits_api(payload: TopupRequest, x_admin_secret: str = Header(Non
 
 @app.get("/")
 def home():
-    return {"status": "TufTactics Semaphore-Protected Async Backend is live with Per-Crew Gender, Romance/Roast & 6-Lang Singing! 🚂🔥"}
+    return {"status": "TufTactics Semaphore-Protected Async Backend is live with Auto-Gender, Romance/Roast & 6-Lang Singing! 🚂🔥"}
