@@ -43,6 +43,11 @@ IP_GENDER_CACHE = {}
 MAX_AUDIO_BYTES = 3 * 1024 * 1024  # 3 MB max walkie-talkie audio
 MAX_REQUESTS_PER_MIN = 18          # Max 18 PTT calls per minute per IP
 
+DIGIT_MAP = {
+    "0": "Zero", "1": "One", "2": "Two", "3": "Three", "4": "Four",
+    "5": "Five", "6": "Six", "7": "Seven", "8": "Eight", "9": "Nine"
+}
+
 
 class VoiceRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=1000)
@@ -142,6 +147,20 @@ async def sync_voice_gender(voice_id: str, client_ip: str):
                     IP_GENDER_CACHE[client_ip] = "Female"
     except Exception:
         pass
+
+
+def clean_tts_reply(raw_text: str) -> str:
+    """Cleans markdown, brackets, adjacent duplicates & normalizes 5-digit train numbers for crisp TTS"""
+    text = re.sub(r"\*+", "", raw_text)
+    text = re.sub(r"#+", "", text)
+    # Remove parenthetical English translations e.g. "விழுப்புரம் (Villupuram)"
+    text = re.sub(r"\([^)]*\)", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    # Remove adjacent duplicate words/phrases (1 to 3 words)
+    text = re.sub(r"\b(\w+(?:\s+\w+){0,2})\s+\1\b", r"\1", text, flags=re.IGNORECASE)
+    # Convert raw 5-digit train numbers into comma-separated English digit words
+    text = re.sub(r"\b\d{5}\b", lambda m: ", ".join(DIGIT_MAP[d] for d in m.group(0)), text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def call_gemini_with_fallback(contents, sys_prompt=None, use_search=False):
@@ -267,8 +286,8 @@ STRICT OPERATIONAL & FORMAT RULES:
 4. 2-LINE SINGING RULE (6 LANGUAGES): If the Loco Pilot asks you to sing a song, NEVER refuse! Immediately sing 2 catchy, melodic lines of a popular song in whichever language he asks for (Tamil, Telugu, Kannada, Hindi, Malayalam, or English — defaulting to {payload.selected_language} if unspecified). Format lyrics rhythmically with "La la la..." or "..." so it sounds musical on voice. Do NOT say "Over" after singing.
 5. 100% CLEAN & PG-13: Keep all roasting, flirting, and romance sweet, tasteful, and PG-13 without vulgar or explicit words.
 6. REAL-TIME KNOWLEDGE: Use Google Search only when asked about live weather, news, scores, or real-world places near stations.
-7. TRAIN NUMBER PRONUNCIATION RULE: ONLY mention train numbers when explicitly asked for train status or enroute traffic. Pronounce digits individually in English (e.g., "One Two Six Six Six").
-8. NO MARKDOWN: NEVER use asterisks (*), bold (**), or hashtags (#). Plain text ONLY.
+7. TRAIN NUMBER PRONUNCIATION RULE: ONLY mention train numbers when explicitly asked for train status or enroute traffic. Pronounce digits individually in English (e.g., "One, Two, Six, Six, Six").
+8. NO MARKDOWN OR BRACKETS: NEVER use asterisks (*), bold (**), hashtags (#), or parenthetical translations in brackets like "விழுப்புரம் (Villupuram)". Plain text ONLY.
 9. STATION NAMES & HALTS: Write station names and halts in the NATIVE SCRIPT of {payload.selected_language} (e.g., in Tamil: "விழுப்புரம்", "தாம்பரம்").
 10. TIME & TECHNICAL TERMS: Expand time with "Hours" (e.g., "16:46 Hours"). Keep technical railway words in English (Line clear, starter signal, home signal, over, section, block, point, loop line, brake pipe, green aspect, red aspect, proceed, platform).
 11. Keep responses punchy (1-2 sentences max). CONDITIONAL "OVER" RULE: End with "Over" ONLY when giving official railway/scenario communication (station clearance, signal aspect, timetable, halts, speed limits, traffic/crossing updates, brake/engine status, or crew duty orders). NEVER say "Over" during casual chat, jokes, roasting, flirting, singing, general knowledge, or weather/news replies.
@@ -280,9 +299,7 @@ STRICT OPERATIONAL & FORMAT RULES:
 
         raw_reply = response.text if (response and response.text) else "Radio signal acknowledged, over."
 
-        cleaned = re.sub(r"\*+", "", raw_reply)
-        cleaned = re.sub(r"#+", "", cleaned)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        cleaned = clean_tts_reply(raw_reply)
 
         return {"reply": cleaned}
     except HTTPException:
